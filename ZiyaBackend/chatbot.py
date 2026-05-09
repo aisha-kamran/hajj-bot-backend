@@ -4,6 +4,7 @@ import re
 import shutil
 import urllib.error
 import urllib.request
+from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,6 +24,8 @@ DB_PATH = str(BASE_DIR / "ziya_vector_db")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("MODEL_NAME", "gemini-1.5-flash")
 
 QUESTION_LABEL = "سوال"
 ANSWER_LABEL = "جواب"
@@ -139,6 +142,7 @@ LOCALIZED_MESSAGES = {
 
 # ---------------- EMBEDDINGS ----------------
 embeddings = None
+catalog_cache = None
 
 
 def get_embeddings():
@@ -152,8 +156,14 @@ def get_embeddings():
 
 # ---------------- HELPERS ----------------
 def load_catalog():
+    global catalog_cache
+    if catalog_cache is not None:
+        return catalog_cache
+
     with open(DATA_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        catalog_cache = json.load(f)
+
+    return catalog_cache
 
 
 def clean_question(text):
@@ -165,6 +175,7 @@ def clean_question(text):
 
 def normalize_query(text):
     text = clean_question(text)
+    text = re.sub(r"\bsa[\u2019'`-]?i\b", "sai", text, flags=re.IGNORECASE)
     roman_words = re.findall(r"[A-Za-z]+", text.lower())
     urdu_terms = [ROMAN_URDU_MAP[word] for word in roman_words if word in ROMAN_URDU_MAP]
 
@@ -178,18 +189,26 @@ def normalize_query(text):
     if "سعی" in text and any(word in text.lower() for word in LOCATION_WORDS):
         urdu_terms.extend(["مسعی", "صفا", "مروہ"])
 
+    if (
+        any(word in text for word in ["صفا", "الصفا"])
+        and any(word in text for word in ["مروہ", "مروۃ", "المروہ", "المروة"])
+        and any(word in text.lower() for word in LOCATION_WORDS)
+    ):
+        urdu_terms.extend(["سعی", "مسعی"])
+
     if urdu_terms:
         return f"{text} {' '.join(dict.fromkeys(urdu_terms))}"
 
     return text
 
 
+@lru_cache(maxsize=4096)
 def tokenize(text):
     text = re.sub(r"[^\w\u0600-\u06FF]+", " ", text)
-    return {
+    return frozenset(
         word for word in text.split()
         if len(word) > 2 and word not in STOP_WORDS
-    }
+    )
 
 
 def is_greeting(text):
@@ -228,15 +247,38 @@ def local_message(kind, language):
     return LOCALIZED_MESSAGES[kind][normalize_language(language)]
 
 
+def normalize_request_data(data):
+    if isinstance(data, dict):
+        return data
+
+    if isinstance(data, str):
+        text = data.strip()
+        if not text:
+            return {}
+
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return {"query": text}
+
+        if isinstance(parsed, dict):
+            return parsed
+
+        return {"query": text}
+
+    return {}
+
+
 def translate_answer(answer, question, language):
     language = normalize_language(language)
     if language == "ur":
         return answer
 
-    if not OPENAI_API_KEY:
-        return answer
-
     target_language = LANGUAGE_NAMES[language]
+
+    if not OPENAI_API_KEY:
+        return translate_answer_with_gemini(answer, question, target_language)
+
     payload = {
         "model": OPENAI_MODEL,
         "input": [
@@ -288,6 +330,36 @@ def translate_answer(answer, question, language):
     return "\n".join(texts).strip() or answer
 
 
+def translate_answer_with_gemini(answer, question, target_language):
+    if not GEMINI_API_KEY:
+        return answer
+
+    try:
+        import google.generativeai as genai
+    except ImportError as e:
+        print("Gemini translation unavailable:", e)
+        return answer
+
+    prompt = (
+        "Translate and lightly summarize this Hajj/Umrah fatwa answer. "
+        "Use only the supplied dataset answer. Do not add any new ruling, "
+        "opinion, or fact. Preserve the ruling and important conditions.\n\n"
+        f"Question: {question}\n"
+        f"Target language: {target_language}\n"
+        "Return 4-6 clear lines in the target language.\n\n"
+        f"Dataset answer:\n{answer[:4000]}"
+    )
+
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        response = model.generate_content(prompt)
+        return (getattr(response, "text", "") or "").strip() or answer
+    except Exception as e:
+        print("Gemini translation error:", e)
+        return answer
+
+
 def format_answer(answer, question, language, limit=1200):
     answer = answer[:limit]
     return translate_answer(answer, question, language)
@@ -296,6 +368,15 @@ def format_answer(answer, question, language, limit=1200):
 def has_sai_location_intent(query):
     query = query.lower()
     return "سعی" in query and any(word in query for word in LOCATION_WORDS)
+
+
+def has_safa_marwah_location_intent(query):
+    query = query.lower()
+    return (
+        any(word in query for word in ["صفا", "الصفا"])
+        and any(word in query for word in ["مروہ", "مروۃ", "المروہ", "المروة"])
+        and any(word in query for word in LOCATION_WORDS)
+    )
 
 
 def has_masjid_nimrah_waqoof_intent(query):
@@ -309,6 +390,7 @@ def has_hayd_sai_intent(query):
 def has_local_concise_intent(query):
     return (
         has_sai_location_intent(query)
+        or has_safa_marwah_location_intent(query)
         or has_masjid_nimrah_waqoof_intent(query)
         or has_hayd_sai_intent(query)
     )
@@ -319,12 +401,38 @@ def sentence_split(text):
     return [part.strip() for part in parts if len(part.strip()) > 20]
 
 
+def trim_to_sentence_boundary(text, max_chars):
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= max_chars:
+        return text
+
+    clipped = text[:max_chars].rstrip()
+    matches = list(re.finditer(r"[۔.!؟?]", clipped))
+    if matches:
+        return clipped[: matches[-1].end()].strip()
+
+    return clipped.rsplit(" ", 1)[0].strip()
+
+
 def extractive_summary(answer, query, max_chars=650):
     query_words = tokenize(query)
     sentences = sentence_split(answer)
 
     if not sentences:
-        return answer[:max_chars]
+        return trim_to_sentence_boundary(answer, max_chars)
+
+    if has_sai_location_intent(query) or has_safa_marwah_location_intent(query):
+        for sentence in sentences:
+            if (
+                ("لہٰذا معلوم ہوا" in sentence or "لہذا معلوم ہوا" in sentence)
+                and any(word in sentence for word in ["مسعیٰ", "مسعٰی", "مسعی"])
+            ):
+                return trim_to_sentence_boundary(sentence, max_chars)
+
+    if "زمزم" in query:
+        for sentence in sentences:
+            if "زمزم" in sentence:
+                return trim_to_sentence_boundary(sentence, max_chars)
 
     scored = []
     for index, sentence in enumerate(sentences[:30]):
@@ -334,6 +442,12 @@ def extractive_summary(answer, query, max_chars=650):
             score += 2
         if "یعنی" in sentence:
             score += 1
+        if "لہٰذا معلوم ہوا" in sentence or "لہذا معلوم ہوا" in sentence:
+            score += 8
+        if has_sai_location_intent(query) and any(
+            word in sentence for word in ["مسعیٰ", "مسعٰی", "مسعی", "مسجد سے خارج"]
+        ):
+            score += 5
         score -= index * 0.05
         scored.append((score, index, sentence))
 
@@ -347,44 +461,19 @@ def extractive_summary(answer, query, max_chars=650):
 
     selected = sorted(selected, key=lambda item: item[1])
     summary = " ".join(sentence for _, _, sentence in selected)
-    return summary[:max_chars].strip()
+    return trim_to_sentence_boundary(summary, max_chars)
 
 
 def concise_dataset_answer(answer, query, language="ur"):
     """
-    Return a short answer that is grounded in the dataset answer text.
-    For "concise intent" queries, we still summarize *the dataset answer* instead
-    of returning hardcoded text, so the response stays consistent with the catalog.
+    Return a short answer that is grounded only in the matched dataset answer text.
     """
-    # Prefer very short, dataset-grounded extracts for common intents.
-    # Many dataset answers are extremely long; we must avoid sending full text.
     q = query or ""
-    picked = ""
-
-    if has_sai_location_intent(q):
-        # Keep this extremely short (UI-friendly) while staying aligned with dataset meaning.
-        concise = {
-            "ur": "سعی صفا اور مروہ کے درمیان مسعیٰ میں ہوتی ہے۔ ڈیٹاسیٹ کے مطابق مسعیٰ مسجد الحرام سے خارج ہے۔",
-            "en": "Sa'i is performed in the Mas'a between Safa and Marwah. According to the dataset, the Mas'a is outside Masjid al-Haram.",
-            "ar": "تكون السعي في المسعى بين الصفا والمروة. ووفقًا للبيانات فالمسعى خارج المسجد الحرام.",
-        }
-        return concise.get(normalize_language(language), concise["ur"])
-
-    if has_hayd_sai_intent(q):
-        concise = {
-            "ur": "حائضہ عورت صفا و مروہ کے درمیان سعی کر سکتی ہے۔ ڈیٹاسیٹ کے مطابق سعی کے لیے طہارت شرط نہیں (مستحب ہے)۔",
-            "en": "A menstruating woman may perform Sa'i between Safa and Marwah. According to the dataset, purity for Sa'i is recommended, not required.",
-            "ar": "يجوز للمرأة الحائض أن تسعى بين الصفا والمروة. ووفقًا للبيانات فالطهارة للسعي مستحبة وليست شرطًا.",
-        }
-        return concise.get(normalize_language(language), concise["ur"])
-
-    if not picked:
-        picked = extractive_summary(answer, q, max_chars=360)
+    picked = extractive_summary(answer, q, max_chars=520)
 
     language = normalize_language(language)
     translated = translate_answer(picked, q, language)
-    # Hard cap to keep replies short in UI (roughly 3–6 lines).
-    return (translated or picked)[:360].strip()
+    return trim_to_sentence_boundary(translated or picked, 700)
 
 
 def catalog_score(query, item):
@@ -405,11 +494,23 @@ def catalog_score(query, item):
     elif question and question in query:
         score += 50
 
-    has_location_intent = "سعی" in query and any(word in query.lower() for word in LOCATION_WORDS)
+    if "زمزم" in query and "زمزم" in text:
+        score += 40
+        if any(word in query for word in ["بئر", "معلومات", "حوالے", "بارے"]):
+            score += 20 if "معلومات" in question else 5
+
+    if "سعی" in query and "صحن" in query and "صحن" in text:
+        score += 60
+        if "سعی" in question and "صحن" in question:
+            score += 30
+
+    has_location_intent = (
+        has_sai_location_intent(query) or has_safa_marwah_location_intent(query)
+    )
     if has_location_intent:
         if "مسعی" in question:
             score += 90
-        if any(word in text for word in ["مسعی", "صفا", "مروہ"]):
+        if any(word in text for word in ["مسعی", "مسعٰی", "مسعیٰ", "صفا", "مروہ"]):
             score += 40
         if any(word in question for word in ["حیض", "حائض", "افضل", "پہلے", "بعد", "تقدیم", "تاخیر", "حکم"]):
             score -= 25
@@ -543,8 +644,9 @@ app.add_middleware(
 
 @app.post("/ask")
 async def ask_bot(request: Request):
+    language = "ur"
     try:
-        data = await request.json()
+        data = normalize_request_data(await request.json())
         language = normalize_language(data.get("language", "ur"))
         original_query = clean_question(data.get("query", ""))
         user_query = normalize_query(original_query)
@@ -557,8 +659,8 @@ async def ask_bot(request: Request):
 
         if has_local_concise_intent(user_query):
             terms = []
-            if has_sai_location_intent(user_query):
-                terms = ["مسعی", "صفا", "مروہ", "سعی"]
+            if has_sai_location_intent(user_query) or has_safa_marwah_location_intent(user_query):
+                terms = ["مسعی", "مسعٰی", "مسعیٰ", "صفا", "مروہ", "سعی"]
             elif has_masjid_nimrah_waqoof_intent(user_query):
                 terms = ["مسجد", "نمرہ", "عرفات", "وقوف"]
             elif has_hayd_sai_intent(user_query):
@@ -621,7 +723,7 @@ async def ask_bot(request: Request):
 
     except Exception as e:
         print("Error:", e)
-        return JSONResponse({"answer": SERVER_ERROR_RESPONSE}, status_code=500)
+        return JSONResponse({"answer": local_message("error", language)}, status_code=500)
 
 
 # ---------------- RUN ----------------
