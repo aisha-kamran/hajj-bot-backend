@@ -22,10 +22,8 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_PATH = BASE_DIR / "product_files" / "product_catalog.json"
 DB_PATH = str(BASE_DIR / "ziya_vector_db")
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("MODEL_NAME", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("MODEL_NAME", "gemini-2.5-flash")
 
 QUESTION_LABEL = "سوال"
 ANSWER_LABEL = "جواب"
@@ -269,68 +267,44 @@ def normalize_request_data(data):
     return {}
 
 
-def translate_answer(answer, question, language):
+# ---------------- SYSTEM PROMPT ----------------
+GEMINI_SYSTEM_PROMPT = (
+    "You are an advanced Islamic Hajj and Umrah AI Assistant with voice interaction support. "
+    "Answer ONLY from the provided Islamic context (dataset answer and reference). "
+    "If authentic information is unavailable in the provided context, clearly say: "
+    "'I could not find authentic information in the provided Islamic sources.' "
+    "Never invent Islamic rulings, duas, hadith, or references. "
+    "Never use general AI knowledge if context is missing. "
+    "Keep answers respectful, clear, beginner-friendly, and spiritually supportive. "
+    "Always prioritize: Quran, Sahih Hadith, authentic scholarly references from the dataset. "
+    "For Hajj/Umrah questions: explain step-by-step, include duas if available in the dataset, "
+    "mention obligatory vs Sunnah actions separately. "
+    "If there are multiple scholarly opinions, mention them respectfully without declaring one sect superior. "
+    "Never answer political debates, extremist content, or unauthenticated Islamic claims. "
+    "Always format answers professionally with title, steps, important notes, and source references. "
+    "Always show source reference at the end if available."
+)
+
+GEMINI_GENERATION_CONFIG = {
+    "temperature": 0.1,
+    "top_p": 0.8,
+    "max_output_tokens": 700,
+}
+
+
+def translate_answer(answer, question, language, reference=""):
     language = normalize_language(language)
     if language == "ur":
+        # Dataset is already in Urdu — return directly with reference appended
+        if reference:
+            return f"{answer}\n\n📚 ماخذ: {reference}"
         return answer
 
     target_language = LANGUAGE_NAMES[language]
-
-    if not OPENAI_API_KEY:
-        return translate_answer_with_gemini(answer, question, target_language)
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "input": [
-            {
-                "role": "system",
-                "content": (
-                    "You translate and lightly summarize Islamic Hajj/Umrah fatwa answers. "
-                    "Use only the supplied dataset answer. Do not add new rulings, opinions, "
-                    "or facts. Preserve the ruling and important conditions."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Question: {question}\n"
-                    f"Target language: {target_language}\n"
-                    "Return 4-6 clear lines in the target language.\n\n"
-                    f"Dataset answer:\n{answer[:4000]}"
-                ),
-            },
-        ],
-    }
-    request = urllib.request.Request(
-        "https://api.openai.com/v1/responses",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=12) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
-        print("OpenAI translation error:", e)
-        return answer
-
-    if data.get("output_text"):
-        return data["output_text"].strip()
-
-    texts = []
-    for item in data.get("output", []):
-        for content in item.get("content", []):
-            if content.get("type") in {"output_text", "text"} and content.get("text"):
-                texts.append(content["text"])
-
-    return "\n".join(texts).strip() or answer
+    return translate_answer_with_gemini(answer, question, target_language, reference)
 
 
-def translate_answer_with_gemini(answer, question, target_language):
+def translate_answer_with_gemini(answer, question, target_language, reference=""):
     if not GEMINI_API_KEY:
         return answer
 
@@ -340,19 +314,23 @@ def translate_answer_with_gemini(answer, question, target_language):
         print("Gemini translation unavailable:", e)
         return answer
 
+    ref_line = f"\nSource Reference: {reference}" if reference else ""
     prompt = (
-        "Translate and lightly summarize this Hajj/Umrah fatwa answer. "
-        "Use only the supplied dataset answer. Do not add any new ruling, "
-        "opinion, or fact. Preserve the ruling and important conditions.\n\n"
         f"Question: {question}\n"
         f"Target language: {target_language}\n"
-        "Return 4-6 clear lines in the target language.\n\n"
+        "Return 4-6 clear lines in the target language. "
+        "Include source reference at the end if provided.\n\n"
         f"Dataset answer:\n{answer[:4000]}"
+        f"{ref_line}"
     )
 
     try:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(GEMINI_MODEL)
+        model = genai.GenerativeModel(
+            GEMINI_MODEL,
+            system_instruction=GEMINI_SYSTEM_PROMPT,
+            generation_config=GEMINI_GENERATION_CONFIG,
+        )
         response = model.generate_content(prompt)
         return (getattr(response, "text", "") or "").strip() or answer
     except Exception as e:
@@ -360,9 +338,9 @@ def translate_answer_with_gemini(answer, question, target_language):
         return answer
 
 
-def format_answer(answer, question, language, limit=1200):
+def format_answer(answer, question, language, limit=1200, reference=""):
     answer = answer[:limit]
-    return translate_answer(answer, question, language)
+    return translate_answer(answer, question, language, reference)
 
 
 def has_sai_location_intent(query):
@@ -464,7 +442,7 @@ def extractive_summary(answer, query, max_chars=650):
     return trim_to_sentence_boundary(summary, max_chars)
 
 
-def concise_dataset_answer(answer, query, language="ur"):
+def concise_dataset_answer(answer, query, language="ur", reference=""):
     """
     Return a short answer that is grounded only in the matched dataset answer text.
     """
@@ -472,7 +450,7 @@ def concise_dataset_answer(answer, query, language="ur"):
     picked = extractive_summary(answer, q, max_chars=520)
 
     language = normalize_language(language)
-    translated = translate_answer(picked, q, language)
+    translated = translate_answer(picked, q, language, reference)
     return trim_to_sentence_boundary(translated or picked, 700)
 
 
@@ -668,14 +646,16 @@ async def ask_bot(request: Request):
             catalog_match = best_catalog_match_with_terms(user_query, terms)
         else:
             catalog_match = best_catalog_match(user_query)
+        reference = ""
         if catalog_match:
             fatwa = clean_fatwa(catalog_match.get("Answer", ""))
+            reference = catalog_match.get("Reference", "")
             if "تفصیل" in user_query or "detail" in user_query.lower():
-                return JSONResponse({"answer": format_answer(fatwa, original_query, language, 2000)})
+                return JSONResponse({"answer": format_answer(fatwa, original_query, language, 2000, reference)})
             if has_local_concise_intent(user_query):
-                return JSONResponse({"answer": concise_dataset_answer(fatwa, user_query, language)})
+                return JSONResponse({"answer": concise_dataset_answer(fatwa, user_query, language, reference)})
             fatwa = concise_dataset_answer(fatwa, user_query, language="ur")
-            return JSONResponse({"answer": format_answer(fatwa, original_query, language)})
+            return JSONResponse({"answer": format_answer(fatwa, original_query, language, reference=reference)})
         else:
             fatwa = ""
 
@@ -703,15 +683,16 @@ async def ask_bot(request: Request):
 
             best_doc = filtered[0]
             fatwa = get_answer_text(best_doc)
+            reference = best_doc.metadata.get("reference", "")
 
             if "تفصیل" in user_query or "detail" in user_query.lower():
-                return JSONResponse({"answer": format_answer(fatwa, original_query, language, 2000)})
+                return JSONResponse({"answer": format_answer(fatwa, original_query, language, 2000, reference)})
 
             if len(fatwa) <= 900:
-                return JSONResponse({"answer": format_answer(fatwa, original_query, language)})
+                return JSONResponse({"answer": format_answer(fatwa, original_query, language, reference=reference)})
 
         # ---------------- DATASET EXTRACTION ----------------
-        answer = concise_dataset_answer(fatwa, user_query, language)
+        answer = concise_dataset_answer(fatwa, user_query, language, reference)
 
         if len(answer) < 20:
             return JSONResponse({"answer": local_message("unclear", language)})
@@ -719,7 +700,7 @@ async def ask_bot(request: Request):
         if has_local_concise_intent(user_query):
             return JSONResponse({"answer": answer})
 
-        return JSONResponse({"answer": translate_answer(answer, original_query, language)})
+        return JSONResponse({"answer": translate_answer(answer, original_query, language, reference)})
 
     except Exception as e:
         print("Error:", e)
